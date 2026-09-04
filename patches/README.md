@@ -353,20 +353,42 @@ Consequences differ by output path, and both are consistent with the report:
   computed at full cost and then discarded — the displayed rate collapses back to the real
   capture rate, which is what "base FPS stuck at 50" looks like.
 
-### The setting to check first, before any rebuild
+### Which of those two applies here: the WSI one
 
-The CPU blit path is selected whenever **NPU or CPU post-processing is enabled**:
+The CPU blit path is selected whenever NPU or CPU post-processing is enabled:
 
 ```cpp
 const bool cpuPostActive = g.npuPostProcessing || g.cpuPostProcessing;
 if (kEnableWsiSwapchain && !cpuPostActive && g.vk.hasSwapchain && ...) { /* WSI */ }
 ```
 
-On that path every posted frame costs a full-resolution `AHardwareBuffer_lock`, an
-`ANativeWindow_lock`, and a per-row `memcpy` — on top of losing the drop-free FIFO queue.
-**Turn NPU and CPU post-processing off** and the session moves to the GPU-only path. GPU
-post-processing does *not* trigger this (it is not part of `cpuPostActive`), so that one is
-safe to leave on.
+On this build neither can be enabled. Both default to false, and every entry point to the
+image-quality UI is compiled out:
+
+```kotlin
+// FeatureFlags.kt
+internal const val SHOW_IMAGE_QUALITY: Boolean = false
+```
+
+`SettingsDrawerOverlay.kt:566` gates the drawer's GPU/NPU/CPU sections on it, and
+`HomeScreen.kt:507` gates the card that navigates to `PARAMS_IMAGE_QUALITY`. The route is
+still registered in the NavHost, but nothing reaches it — so the screen is unreachable and
+the two prefs keep their `false` default unless an older build once wrote them.
+
+So `cpuPostActive` is false, the WSI swapchain path is the live one, and the drop variant
+above does **not** apply. What remains is the FIFO variant: `VK_PRESENT_MODE_FIFO_KHR`
+never drops, so the bunched frames are all presented, one per vsync, at the panel's cadence
+instead of at their correct spacing — and `vkAcquireNextImageKHR` on a 3-image swapchain
+then throttles the worker to roughly one cycle per (frames-posted × vsync period).
+
+Confirm which path a session actually took with:
+
+```sh
+adb logcat -s LSFG lsfg_native | grep "Output surface attached"
+```
+
+`path=WSI` is the expected one. `path=CPU (post-process=on)` would mean a stale pref did
+get set and the drop variant is live after all.
 
 ### Why this isn't fixed in the branch
 
@@ -396,7 +418,8 @@ frame profile (avg over N): copy=… present=… waitIdle=… blitWork=… wallE
 
 - `waitIdle` dominant → the cross-device sync in §2c is the bottleneck; the capture-scale
   slider is the lever, and a shared semaphore is the real fix.
-- `blitWork` dominant → you are on the CPU blit path; turn off NPU/CPU post-processing.
+- `blitWork` dominant → the CPU blit path is somehow active (see above) or the GPU
+  post-processing stage is heavy.
 - `copy` dominant → full-resolution AHB copies; capture scale again.
 - All small but `wallEnd` large → the time is going to pacing sleeps, and fix (2) above is
   the answer.
