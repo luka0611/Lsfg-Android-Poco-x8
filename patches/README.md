@@ -277,3 +277,116 @@ Three things in there settle the open questions above:
   buffers are CPU-lockable on your device, which decides the 2a A/B;
 - your exact model and Android version — Poco X8 and X8 Pro are different SoCs and GPU
   vendors, and the AFBC/UBWC reasoning in 2a differs between them.
+
+---
+
+## 3. "Base FPS stuck at 50, very stuttery" — pacing is bypassed exactly when it's needed
+
+This is a separate mechanism from §2, and it is the most likely cause of the stutter.
+
+Each captured frame produces `multiplier - 1` generated frames plus the real one. The
+worker spaces them across the capture interval:
+
+```cpp
+auto remainingBudget = captureInterval - (now - frameWorkStartedAt);
+if (remainingBudget < State::Clock::duration::zero()) remainingBudget = 0;
+const auto slotCount = static_cast<int64_t>(g.outputs.size() + 1);
+const auto step = remainingBudget / slotCount;
+```
+
+`captureInterval` is an EMA of the delta between the capture timestamps of frames **the
+worker actually processed**. Frames dropped by the `queueDepth` bound never update it. So
+once the worker is the bottleneck, `captureInterval` converges on *the worker's own
+throughput*, and `remainingBudget = captureInterval - workTime` converges on **zero**.
+
+`step` then goes to zero, and both layers of vsync alignment switch themselves off:
+
+```cpp
+deadline += step;
+if (step > State::Clock::duration::zero()) {          // ← skipped entirely at step == 0
+    deadline = sleepUntilVsyncAligned(deadline, lastPostedAt, step);
+}
+```
+
+```cpp
+const auto minSeparatedSlot = period - slack;
+if (slotBudget < minSeparatedSlot) {                   // ← 8.33ms − 2ms = 6.33ms at 120 Hz
+    std::this_thread::sleep_until(deadline);           //   any smaller step: no separation
+    return deadline;
+}
+```
+
+So every generated frame is posted back-to-back with the real one, with no spacing. The
+function's own comment says what that produces:
+
+> if the computed deadline lies in the same vsync slot as that post, we push it to the NEXT
+> boundary so the SurfaceFlinger queue doesn't collapse two buffers onto one flip (**which
+> is what produces the steady-state "bunched" stutter we see with multiplier≥2**)
+
+The guard disables that protection in precisely the regime where the collision happens.
+Pacing works when there is idle budget and stops working as soon as the GPU is saturated.
+
+Consequences differ by output path, and both are consistent with the report:
+
+- **WSI swapchain path** (the default when no NPU/CPU post-processing is on): present mode
+  is `VK_PRESENT_MODE_FIFO_KHR`, so nothing is dropped — the two frames are shown at
+  consecutive vsyncs instead of at their correct 10 ms spacing. Interpolated frames
+  displayed at the wrong times *is* judder, and `vkAcquireNextImageKHR` back-pressure then
+  throttles the worker.
+- **CPU blit path**: `ANativeWindow_unlockAndPost` twice inside one vsync means
+  SurfaceFlinger latches the newer buffer and drops the older, so the generated frame is
+  computed at full cost and then discarded — the displayed rate collapses back to the real
+  capture rate, which is what "base FPS stuck at 50" looks like.
+
+### The setting to check first, before any rebuild
+
+The CPU blit path is selected whenever **NPU or CPU post-processing is enabled**:
+
+```cpp
+const bool cpuPostActive = g.npuPostProcessing || g.cpuPostProcessing;
+if (kEnableWsiSwapchain && !cpuPostActive && g.vk.hasSwapchain && ...) { /* WSI */ }
+```
+
+On that path every posted frame costs a full-resolution `AHardwareBuffer_lock`, an
+`ANativeWindow_lock`, and a per-row `memcpy` — on top of losing the drop-free FIFO queue.
+**Turn NPU and CPU post-processing off** and the session moves to the GPU-only path. GPU
+post-processing does *not* trigger this (it is not part of `cpuPostActive`), so that one is
+safe to leave on.
+
+### Why this isn't fixed in the branch
+
+Two candidate fixes, and picking between them needs measurements from the device rather
+than a guess:
+
+1. Drop the `slotBudget < minSeparatedSlot` early-return so posts are always separated by a
+   vsync. Simple, but it makes the worker sleep ~8 ms per capture when it is already behind,
+   which would *lower* the real frame rate.
+2. Post only as many generated frames as there are whole vsync slots in the remaining
+   budget, aligned, and skip the rest. Strictly better in principle — the skipped frames
+   were being discarded or mistimed anyway, and not computing them frees GPU time — but it
+   is a rewrite of the frame scheduler.
+
+Changing frame scheduling blind, with no device to measure on, is how a build gets worse
+instead of better. The instrumentation already in the render loop settles it in one line.
+
+### The measurement that decides it
+
+```sh
+adb logcat -s LSFG lsfg_native | grep "frame profile"
+```
+
+```
+frame profile (avg over N): copy=… present=… waitIdle=… blitWork=… wallEnd=… queue=… latency=…
+```
+
+- `waitIdle` dominant → the cross-device sync in §2c is the bottleneck; the capture-scale
+  slider is the lever, and a shared semaphore is the real fix.
+- `blitWork` dominant → you are on the CPU blit path; turn off NPU/CPU post-processing.
+- `copy` dominant → full-resolution AHB copies; capture scale again.
+- All small but `wallEnd` large → the time is going to pacing sleeps, and fix (2) above is
+  the answer.
+
+Also worth capturing, since it measures the stutter directly rather than inferring it:
+`getRecentPostIntervalsNs` feeds the frame-graph HUD with real inter-post intervals. A
+clean 2× looks like evenly spaced posts; the bunching described above looks like pairs of
+posts with a gap after each pair.
