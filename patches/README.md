@@ -428,3 +428,126 @@ Also worth capturing, since it measures the stutter directly rather than inferri
 `getRecentPostIntervalsNs` feeds the frame-graph HUD with real inter-post intervals. A
 clean 2× looks like evenly spaced posts; the bunching described above looks like pairs of
 posts with a gap after each pair.
+
+---
+
+## 4. Measured on device — what the numbers settled
+
+Benchmark report + logcat from the actual hardware. Device is **not** what I assumed
+earlier: Xiaomi `2511FPC34G` / `klee`, **MediaTek mt6899**, **Mali-G720 MC8**,
+**Android 16 (SDK 36)**, panel modes 1268x2756 @ 30/60/90/120. Target app
+`com.xd.TLglobal` (Torchlight), which renders ~60 fps unassisted.
+
+Benchmark runs used capture scale 0.70 → `render_size = 1928x888`. That is exactly
+`scaleDimension(2756, 0.70) = 1928` and `scaleDimension(1268, 0.70) = 888`, so the new
+slider does what it was built to do.
+
+### 2a is confirmed outright
+
+```
+pushFrame #1 ahb=2756x1268 stride=2816 fmt=1 usage=0x300
+```
+
+`0x300` = `GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT`, every `CPU_READ` bit clear. Exactly the
+predicted allocation. Consequence, in all three runs:
+
+```
+real_fps        = 0.00
+unique_captures = 0
+```
+
+`captureContentHash` can never succeed on this device, so the metric was pinned at zero —
+which is also what the user saw in the HUD. Fixed by counting delivered captures once
+hashing is known impossible.
+
+### waitIdle is the bottleneck, and it is not close
+
+| run | copy | present | **waitIdle** | blit | total | waitIdle share |
+|---|---|---|---|---|---|---|
+| x2 | 4.31 | 1.70 | **12.29** | 3.54 | 25.55 | **48%** |
+| x3 | 4.12 | 2.15 | **19.95** | 5.29 | 39.31 | **51%** |
+| x4 | 3.84 | 3.01 | **24.04** | 8.60 | 51.33 | **47%** |
+
+Roughly half of every frame is spent in the cross-device `vkDeviceWaitIdle` of §2c.
+
+Capture scale earns its place against the same measurement — 2x at 1.00 (from logcat)
+versus 2x at 0.70 (benchmark): waitIdle 19.0 → 12.29 ms (−35%), total 34.5 → 25.55 ms
+(−26%).
+
+### 3 is confirmed, and the model predicts the exact numbers
+
+| run | vsync_alignment | stalls | jitter | pacing_min |
+|---|---|---|---|---|
+| x2 | 21.3% | 0 | 0.613 | 0.61 ms |
+| x3 | 1.6% | 5 | 0.828 | 0.50 ms |
+| x4 | **0.0%** | 14 | 0.985 | 0.54 ms |
+
+Posts landing 0.5 ms apart is the bunching, measured. Working the model with the session's
+actual pacing preset (`slack=1.5ms`, so `minSeparatedSlot = 8.33 − 1.5 = 6.83 ms` at
+120 Hz):
+
+| run | remainingBudget = total − (copy+pres+wait) | step = budget / slotCount | ≥ 6.83 ms? |
+|---|---|---|---|
+| x2 | 25.55 − 18.30 = 7.25 | 3.63 | no |
+| x3 | 39.31 − 26.22 = 13.09 | 4.36 | no |
+| x4 | 51.33 − 30.88 = 20.45 | 5.11 | no |
+
+`step` never reaches the threshold, so alignment never engages — matching 21.3 / 1.6 / 0.0%.
+
+### The conclusion that changes the plan
+
+**The pacing fix cannot be made to work first.** Both options in §3 assumed there was budget
+to redistribute. There is not: at x3 the GPU work is 26.2 ms of a 39.3 ms capture interval,
+and three posts spaced one vsync apart need 20.5 ms that does not exist. Forcing separation
+would just stall the worker and cut the real rate further.
+
+Remove `waitIdle` and the arithmetic inverts: work drops to ~6.3 ms of a 39 ms interval,
+leaving ~33 ms to place three posts ~11 ms apart — comfortably above the 6.83 ms floor.
+**Pacing becomes fixable only after the semaphore work, and is largely fixed by it.**
+
+So §3's "two candidate fixes" is superseded: the answer is neither, it is §2c.
+
+### The semaphore path already exists in the API
+
+```cpp
+// framegen/public/lsfg_3_1.hpp
+void presentContext(int32_t id, int inSem, const std::vector<int>& outSem);
+//   @param inSem  Semaphore to wait on before starting the generation.
+//   @param outSem Semaphores to signal once each output image is ready.
+```
+
+The Android wrapper passes neither:
+
+```cpp
+std::vector<int> outSems;  // empty
+LSFG_3_1::presentContext(g.framegenCtxId, /*inSem*/ -1, outSems);
+```
+
+and framegen honours them only when `inSem >= 0` (`context.cpp:142,166,216`). The catch is
+the handle type: framegen imports with `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT`
+(`framegen/src/core/semaphore.cpp:63`), while Android's native external type is `SYNC_FD` —
+the same mismatch the `createContextFromAHB` comment describes for *memory*. Whether Mali
+supports OPAQUE_FD semaphores decides if this is an app-only change or needs framegen
+changing too, so the build now probes and logs it:
+
+```
+external semaphore OPAQUE_FD: exportable=? importable=? — semaphore-based framegen sync ...
+```
+
+### Secondary observations
+
+- **x4 is counterproductive.** posted_fps peaks at x3 (76.40) and *falls* at x4 (72.81)
+  while stalls nearly triple (5 → 14). x3 is the practical ceiling on this device.
+- **Real rate falls as multiplier rises** — derived `posted − generated`: 30.5 (x2),
+  25.5 (x3), 18.2 (x4), against ~60 fps unassisted. At x2 the total (60.9) merely matches
+  what the game already did on its own, with 67–95 ms of added latency.
+- **Crash at 4x + capture 1.00.** Last line before process death is
+  `Re-init LSFG context pass=1 2756x1268 render=2756x1268 multiplier=4`. The same 4x run
+  completes fine at 0.70 (half the pixels), so this looks like an allocation failure at
+  full resolution — three output AHBs at ~14 MB each plus input slots plus framegen's
+  pyramid. Not yet confirmed; the crash file itself was not captured.
+- **`display_refresh = 60.0` in the report is the idle rate**, sampled after the session
+  ended — not what the panel ran at. `posted_fps = 76.40` could not have been achieved
+  against a 60 Hz panel, so it was at 90 or 120 during the run.
+- **The log file reached 176 MB.** `LsfgLog.append` opens a `FileWriter` per call with no
+  rotation or size cap. Worth bounding regardless of anything else here.
