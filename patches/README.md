@@ -15,16 +15,21 @@ The fixes are committed to your app fork, on branch
 
 <https://github.com/luka0611/lsfg-android-application-poco-x8/tree/claude/lsfg-mobile-performance-nhe9vx>
 
-**Not built as an APK and not run on a device** — there is no Android SDK/NDK in the
-environment this was written in. What *was* verified: `kotlinc` type-checks every changed
-Kotlin file against an `android.jar` with no error referencing the new code, and the
-rewritten `captureContentHash` compiles under `clang -std=c++20`. Treat it as reviewed and
-type-checked, not tested. The reasoning behind each change is below so you can judge it
-yourself.
+Debug APKs are built by GitHub Actions (`.github/workflows/build-apk.yml`) from that
+branch plus the matching framegen branch, and several rounds have now been run on the
+device; §4 and §5 are measurements, not predictions. Sections 1–3 were written before any
+of that and are kept as the original reasoning — where a later measurement overturned one,
+the correction says so in place.
 
 ---
 
 ## 1. Shizuku capture: the reflection target no longer exists on Android 14+
+
+> **Outcome: abandoned.** The async-listener diagnosis below was right and is fixed, but
+> it turned out to be the first of four blockers, and the last one is structural. See
+> [§5](#5-shizuku-why-it-was-abandoned) for what the device actually reported and why this
+> cannot be finished from inside the app.
+
 
 `PrivilegedScreenCapture` (used by **both** the Shizuku and the root capture paths)
 resolves the screenshot API by reflection and requires a **single-argument**
@@ -551,3 +556,143 @@ external semaphore OPAQUE_FD: exportable=? importable=? — semaphore-based fram
   against a 60 Hz panel, so it was at 90 or 120 during the run.
 - **The log file reached 176 MB.** `LsfgLog.append` opens a `FileWriter` per call with no
   rotation or size cap. Worth bounding regardless of anything else here.
+
+---
+
+## 5. Shizuku: why it was abandoned
+
+Four rounds, each costing a build and a device test. The fixes for the first three are in
+the branch and are correct; the fourth cannot be fixed from here.
+
+1. **Async listener.** §1's diagnosis, confirmed: the one-argument `captureDisplay` is
+   gone on Android 14+. Fixed by probing for `createSyncCaptureListener()` +
+   `captureDisplay(args, listener)`.
+2. **A swallowed exception.** With that fixed, the device reported *"no usable Builder
+   constructor"* — which was false. `findDisplayToken()` was throwing inside a
+   `runCatching`, and the failure surfaced several layers up as the wrong cause. Each
+   layer here reported a generic error that pointed somewhere other than the fault; the
+   fix names every strategy attempted in the thrown message.
+3. **The class is not on the app classpath.** `DisplayControl` — which has owned
+   `getPhysicalDisplayToken` since Android 14 moved it off `SurfaceControl` — ships in
+   `services.jar`, system_server's own jar, so `Class.forName` can never find it from a
+   Shizuku user service. Fixed with a `PathClassLoader` over
+   `/system/framework/services.jar`, plus `System.loadLibrary("android_servers")` for the
+   JNI those methods need.
+4. **The class loads; its native methods never bind.** `libandroid_servers.so` registers
+   its JNI against the class loader that loaded it — the app's — while `DisplayControl`
+   comes from a separate `PathClassLoader`. The two never meet, so the methods resolve and
+   then fail. Putting `services.jar` on the *process* classpath would fix it, and that is
+   Shizuku's launcher's decision, not this app's.
+
+Ruled out along the way, by running commands as uid 2000 through aShell on the device
+itself:
+
+| Hypothesis | Command | Result |
+|---|---|---|
+| HyperOS blocks privileged capture | `screencap -p /sdcard/t.png` | 231 KB PNG — capture works |
+| `services.jar` unreadable | `ls -l /system/framework/services.jar` | mode 644, 35 MB |
+| Wrong class name | `dexdump` over its dex members | `Lcom/android/server/display/DisplayControl;` in classes2.dex **and** classes3.dex; no `android.view.DisplayControl` on this ROM |
+| No display to capture | `dumpsys display` | `mPhysicalDisplayId=4627039422300187648`, 120 Hz modeId 3 |
+
+So none of the usual suspects applied, and the remaining one is a class-loader boundary.
+
+MediaProjection stays the capture path, which is fine — §4 established the frame cost is
+in framegen's cross-device sync, not in capture.
+
+---
+
+## 6. Removing waitIdle: what was built
+
+§4's conclusion was that `waitIdle` is the whole game and pacing only becomes fixable
+after it. Both halves are now written.
+
+### Why the existing `outSem` parameter could not be used
+
+`presentContext(id, inSem, outSem)` assumes **OPAQUE_FD** semantics: the caller owns a
+semaphore, framegen imports the same shared payload and signals it. The device says that
+is not available:
+
+```
+external semaphore support: OPAQUE_FD=0 SYNC_FD=3
+(bit0 exportable, bit1 importable)
+```
+
+Mali-G720 supports OPAQUE_FD semaphores in **neither** direction. It supports SYNC_FD in
+both — but SYNC_FD has no shared payload at all. An import is always temporary and exists
+only to wait on work someone else already submitted. There is no way to hand framegen a
+SYNC_FD semaphore for it to signal.
+
+**So the direction had to invert.** Framegen signals its own semaphore per pass, exports
+the pending signal as an Android sync fd, and hands the fd over; the caller imports and
+waits. That is a framegen change, not an app-only one — which is why both forks moved.
+
+### The two waits, separated
+
+`waitIdle` was doing two jobs with very different deadlines:
+
+| | what it protects | when it is actually needed |
+|---|---|---|
+| output | an output AHB must not be read before its pass finishes | before *that* blit |
+| input | an input AHB must not be overwritten before the **last** pass, which carries framegen's release barrier for both inputs | before the *next* capture is copied in |
+
+The output wait moved onto the GPU: each blit's `vkQueueSubmit` waits on its own imported
+fence, so the submit is issued immediately and the GPU stalls instead of the render thread.
+The input wait moved to the last possible moment — a `poll()` on a `dup()` of the last
+pass's fd, immediately before the next `processRealFrameIntoSlot`. In the steady state it
+returns at once, because by then framegen has had a whole capture interval to finish.
+
+A third handle on the same fence gates the blit of the *real* capture: that blit reads an
+input AHB and performs a queue-family ownership transfer on it, which must not overlap
+framegen's matching release. `waitIdle` used to order those two implicitly.
+
+### What keeps it correct
+
+- **Re-importing a semaphore** is only legal when nothing is pending on it.
+  `processRealFrameIntoSlot` ends in `vkQueueWaitIdle` on the app's compute queue on all
+  three of its paths, and runs earlier in the same worker iteration than the import — so
+  the previous frame's blits have retired. The same drain also orders those blits ahead of
+  framegen's next write to the same output AHBs.
+- **Framegen must not destroy an export semaphore while its signal is pending.** The first
+  version created them in `present()`'s scope, where `Core::Semaphore`'s shared_ptr deleter
+  destroyed them at the end of the call — undefined behaviour on exactly the path meant to
+  make things faster. They now live in `RenderData` beside `outSemaphores`, whose slot is
+  only reused after its completion fences have been waited on.
+- **The gate is narrow.** Only the WSI swapchain blit has a submit to hang a wait on; every
+  other output path reads pixels through `AHardwareBuffer_lock`, where a fence wait costs
+  what `waitIdle` already cost. NPU/CPU/GPU post-process, the CPU blit fallback, a driver
+  that cannot import SYNC_FD, and a framegen build without
+  `VK_KHR_external_semaphore_fd` all keep the old behaviour.
+- **Failures latch, they do not retry.** A short fd list, a refused import or a fence that
+  misses the 500 ms poll logs once, turns the path off for the session and falls back.
+
+This does not change the unbounded-hang property `waitIdle` already had: a wedged framegen
+device still blocks the next input copy's queue drain. The timeout only ensures it is named
+in the log first.
+
+### How to A/B it
+
+"GPU sync" is a live toggle in the in-session drawer and on the Params screen — no session
+restart, so the HUD reacts within a frame either way. The benchmark report gains a
+`gpu_sync` line naming which mode ran, the fraction of presents that took it, and the total
+CPU time left in the deferred input wait.
+
+The baseline to beat, MediaProjection at capture 0.70, from the run immediately before this
+change:
+
+| run | real_fps | generated | posted | waitIdle | total | vsync_align | stalls |
+|---|---|---|---|---|---|---|---|
+| x2 | 38.16 | 34.03 | 68.06 | 14.47 | 29.94 | 22.0% | 5 |
+| x3 | 38.19 | 41.78 | 62.68 | 21.15 | 45.57 | 3.9% | 13 |
+| x4 | 37.94 | 42.18 | 56.25 | 28.51 | 68.57 | 9.4% | 26 |
+
+Same report also confirmed two earlier fixes working: `import_cache = 99.6% hit (4727 hits,
+20 misses)`, and the duplicate-detection guard correctly disabling itself with
+`capture buffers are not CPU-readable (usage=0x300)`.
+
+### What it would take to reach 120 Hz
+
+120 fps output means every posted frame lands inside 8.33 ms. At x2 the pipeline currently
+spends 29.9 ms per capture producing two posts — 15 ms each. Removing 14.5 ms of `waitIdle`
+brings that to roughly 7.7 ms each, which is the first time the arithmetic even permits
+120. Whether it gets there depends on how much of framegen's GPU work genuinely overlaps
+the blits rather than merely moving; the A/B measures precisely that.
