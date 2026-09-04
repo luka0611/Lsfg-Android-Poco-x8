@@ -295,11 +295,26 @@ const auto step = remainingBudget / slotCount;
 ```
 
 `captureInterval` is an EMA of the delta between the capture timestamps of frames **the
-worker actually processed**. Frames dropped by the `queueDepth` bound never update it. So
-once the worker is the bottleneck, `captureInterval` converges on *the worker's own
-throughput*, and `remainingBudget = captureInterval - workTime` converges on **zero**.
+worker actually processed** — `prevCaptureTimestampNs` is only updated for dequeued frames,
+and frames dropped by the `queueDepth` bound never touch it. While the worker keeps up,
+that delta is the source's render interval, which is what the pacer wants. Once the worker
+is the bottleneck it becomes *the worker's own period* instead, and the pacer starts
+measuring itself.
 
-`step` then goes to zero, and both layers of vsync alignment switch themselves off:
+That feedback loop has a stable bad equilibrium. Worker period = copy + present + waitIdle
++ blits + sleeps, so
+
+```
+remainingBudget = captureInterval − (copy + present + waitIdle) = blits + sleeps
+```
+
+Start from sleeps = 0. Then `step = blitTime / slotCount` — a few ms at most, which is
+below the `period − slack` threshold (6.33 ms at 120 Hz), so no separation is inserted,
+so sleeps stay 0 on the next cycle, which keeps `step` small. The pacer cannot bootstrap
+its way out: the budget that would let it separate posts is only available if it had
+separated them already. That is the "stuck" in "stuck at 50".
+
+Both layers of vsync alignment switch themselves off in that state:
 
 ```cpp
 deadline += step;
