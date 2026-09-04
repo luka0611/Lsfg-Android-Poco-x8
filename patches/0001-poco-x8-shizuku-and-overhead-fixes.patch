@@ -1,0 +1,242 @@
+diff --git a/app/src/main/cpp/lsfg_render_loop.cpp b/app/src/main/cpp/lsfg_render_loop.cpp
+index ee46299..c49eca2 100644
+--- a/app/src/main/cpp/lsfg_render_loop.cpp
++++ b/app/src/main/cpp/lsfg_render_loop.cpp
+@@ -378,8 +378,17 @@ void noteGpuShaderPassPending() {
+ // each luma by >>2 (dropping 2 LSBs) suppresses encoder dither noise that
+ // would otherwise mark semantically-identical frames as "different".
+ //
+-// Cost: ~50-100 μs total — 1× AHardwareBuffer_lock (the AHB was allocated
+-// with CPU_READ_OFTEN so the lock is cheap), 64× 4-byte reads, unlock.
++// Cost when the capture buffers really are CPU-readable: ~50-100 μs — 1×
++// AHardwareBuffer_lock, 64× 4-byte reads, unlock. CaptureEngine.setLsfgMode
++// therefore allocates the ImageReader with USAGE_CPU_READ_OFTEN; the privileged
++// (Shizuku / root) path has no such control, because the buffer's usage is
++// chosen by SurfaceFlinger.
++//
++// When the lock is refused the cost is not zero: it is a failed ioctl per
++// captured frame, plus the loss of duplicate detection, which is far more
++// expensive than the hash it was meant to pay for. So give up after a short
++// run of failures and let every frame through instead of retrying forever.
++//
+ // Called once per pushFrame from the ImageReader listener thread.
+ //
+ // Returns 0 on any failure (the caller treats 0 as "unknown" and doesn't
+@@ -387,6 +396,14 @@ void noteGpuShaderPassPending() {
+ // one frame).
+ uint32_t captureContentHash(AHardwareBuffer *ahb) {
+     if (ahb == nullptr) return 0;
++    // Set once the driver has made it clear it will not hand us a CPU mapping
++    // for these buffers. Relaxed ordering is enough: a few extra attempts
++    // racing across threads are harmless, and the value only ever goes false.
++    static std::atomic<bool> hashingSupported{true};
++    static std::atomic<uint32_t> lockFailures{0};
++    constexpr uint32_t kMaxLockFailures = 8;
++    if (!hashingSupported.load(std::memory_order_relaxed)) return 0;
++
+     AHardwareBuffer_Desc desc{};
+     AHardwareBuffer_describe(ahb, &desc);
+     if (desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM &&
+@@ -395,9 +412,27 @@ uint32_t captureContentHash(AHardwareBuffer *ahb) {
+         // bytes. The counter will look stuck but the app won't misbehave.
+         return 0;
+     }
++    if ((desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) == 0) {
++        // Locking a buffer for an access its allocation never declared is
++        // outside the AHardwareBuffer contract. Drivers that honour it anyway
++        // do so by resolving the whole compressed surface to linear, on this
++        // thread, every frame — which back-pressures the capture pipeline
++        // hard enough to cost the foreground app frames.
++        if (hashingSupported.exchange(false, std::memory_order_relaxed)) {
++            LOGW("capture buffers are not CPU-readable (usage=0x%llx) — "
++                 "duplicate-frame detection disabled",
++                 static_cast<unsigned long long>(desc.usage));
++        }
++        return 0;
++    }
+     void *ptr = nullptr;
+     if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+             -1, nullptr, &ptr) != 0 || ptr == nullptr) {
++        if (lockFailures.fetch_add(1, std::memory_order_relaxed) + 1 >= kMaxLockFailures &&
++            hashingSupported.exchange(false, std::memory_order_relaxed)) {
++            LOGW("AHardwareBuffer_lock failed %u times on capture buffers — "
++                 "duplicate-frame detection disabled", kMaxLockFailures);
++        }
+         return 0;
+     }
+     const uint32_t stride = desc.stride * 4u;  // 4 bytes per RGBA8 pixel
+diff --git a/app/src/main/java/com/lsfg/android/session/CaptureEngine.kt b/app/src/main/java/com/lsfg/android/session/CaptureEngine.kt
+index 3eb4249..1671de1 100644
+--- a/app/src/main/java/com/lsfg/android/session/CaptureEngine.kt
++++ b/app/src/main/java/com/lsfg/android/session/CaptureEngine.kt
+@@ -305,7 +305,17 @@ class CaptureEngine(
+             // collapsing to the latest frame during fast camera motion.
+             5,
+             android.hardware.HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or
+-                    android.hardware.HardwareBuffer.USAGE_GPU_COLOR_OUTPUT
++                    android.hardware.HardwareBuffer.USAGE_GPU_COLOR_OUTPUT or
++                    // The native side locks every captured buffer for CPU read to compute
++                    // the duplicate-frame hash (captureContentHash in lsfg_render_loop.cpp).
++                    // Without CPU_READ usage here that lock is outside the AHardwareBuffer
++                    // contract: drivers either reject it — silently disabling duplicate
++                    // detection, so every capture runs the full framegen pipeline — or
++                    // service it by resolving the whole compressed (AFBC/UBWC) surface to
++                    // linear on the capture thread, once per frame at full resolution.
++                    // Declaring the access up front lets gralloc pick a layout that can
++                    // actually satisfy it.
++                    android.hardware.HardwareBuffer.USAGE_CPU_READ_OFTEN
+         )
+         reader.setOnImageAvailableListener({ r ->
+             // In LSFG mode we want temporal continuity more than minimum latency:
+diff --git a/app/src/main/java/com/lsfg/android/session/OverlayManager.kt b/app/src/main/java/com/lsfg/android/session/OverlayManager.kt
+index 33a81c1..7a4790c 100644
+--- a/app/src/main/java/com/lsfg/android/session/OverlayManager.kt
++++ b/app/src/main/java/com/lsfg/android/session/OverlayManager.kt
+@@ -118,9 +118,21 @@ class OverlayManager(private val ctx: Context) {
+         @Suppress("DEPRECATION")
+         wm.defaultDisplay.getRealMetrics(metrics)
+         @Suppress("DEPRECATION")
+-        requestedRefreshRateHz = wm.defaultDisplay.supportedModes
++        val maxSupportedHz = wm.defaultDisplay.supportedModes
+             .maxOfOrNull { it.refreshRate }
+             ?: wm.defaultDisplay.refreshRate
++        // The refresh-rate override is a power/thermal lever, not just a pacing hint:
++        // Surface.setFrameRate below pins the panel for as long as the overlay lives, so
++        // leaving it at the panel maximum keeps SurfaceFlinger compositing the capture
++        // VirtualDisplay and the overlay at (say) 120 Hz even when the target app renders
++        // far slower. On mid-range parts that alone costs the game a chunk of its GPU
++        // budget. Honour the user's choice here as well, and only fall back to the panel
++        // maximum while the setting is on AUTO.
++        requestedRefreshRateHz = if (prefs.vsyncRefreshOverride != VsyncRefreshOverride.AUTO) {
++            prefs.vsyncRefreshOverride.hz.toFloat().coerceAtMost(maxSupportedHz)
++        } else {
++            maxSupportedHz
++        }
+         // Let the native pacer align its sleeps to this display's vsync.
+         // Without it two consecutive unlockAndPost calls (gen + real, or two
+         // generated) can land in the same SurfaceFlinger slot and one gets
+@@ -128,8 +140,6 @@ class OverlayManager(private val ctx: Context) {
+         // disable this or force a specific refresh rate via settings.
+         val effectiveHz = if (!prefs.vsyncAlignmentEnabled) {
+             0f
+-        } else if (prefs.vsyncRefreshOverride != VsyncRefreshOverride.AUTO) {
+-            prefs.vsyncRefreshOverride.hz.toFloat()
+         } else {
+             requestedRefreshRateHz
+         }
+diff --git a/app/src/main/java/com/lsfg/android/session/PrivilegedScreenCapture.kt b/app/src/main/java/com/lsfg/android/session/PrivilegedScreenCapture.kt
+index b0b3222..475758c 100644
+--- a/app/src/main/java/com/lsfg/android/session/PrivilegedScreenCapture.kt
++++ b/app/src/main/java/com/lsfg/android/session/PrivilegedScreenCapture.kt
+@@ -19,12 +19,10 @@ internal class PrivilegedScreenCapture(
+     height: Int,
+     targetUid: Int,
+ ) {
+-    private val captureDisplay: Method
+-    private val args: Any
+-    private val getHardwareBuffer: Method
++    private val backend: Backend
+ 
+     init {
+-        val backend = listOf(
++        backend = listOf(
+             "android.window.ScreenCapture",
+             "android.view.SurfaceControl",
+         ).firstNotNullOfOrNull { className ->
+@@ -33,14 +31,11 @@ internal class PrivilegedScreenCapture(
+                 .getOrNull()
+         }
+             ?: throw IllegalStateException("No privileged ScreenCapture backend with UID filter is available")
+-        captureDisplay = backend.captureDisplay
+-        args = backend.args
+-        getHardwareBuffer = backend.getHardwareBuffer
+     }
+ 
+     fun captureHardwareBuffer(): HardwareBuffer? {
+-        val screenshot = captureDisplay.invoke(null, args) ?: return null
+-        return getHardwareBuffer.invoke(screenshot) as? HardwareBuffer
++        val screenshot = backend.capture() ?: return null
++        return backend.getHardwareBuffer.invoke(screenshot) as? HardwareBuffer
+     }
+ 
+     private fun buildBackend(
+@@ -61,11 +56,57 @@ internal class PrivilegedScreenCapture(
+         }
+         val builtArgs = builderClass.getMethod("build").invoke(builder)
+             ?: throw IllegalStateException("$captureClassName args build returned null")
+-        return Backend(
+-            captureDisplay = findSingleArgMethod(captureClass, "captureDisplay", argsClass),
+-            args = builtArgs,
+-            getHardwareBuffer = findNoArgMethod(screenshotClass, "getHardwareBuffer"),
+-        )
++        val getHardwareBuffer = findNoArgMethod(screenshotClass, "getHardwareBuffer")
++
++        // Android 14 (U) moved the screenshot entry points to android.window.ScreenCapture
++        // and made them asynchronous: captureDisplay(args, listener) returns an int status
++        // and the screenshot arrives through the listener. The synchronous single-argument
++        // overload that Android 12/13 exposed no longer exists there, so probe for the async
++        // form first and keep the legacy one only as a fallback for older releases.
++        findAsyncCapture(captureClass, argsClass, builtArgs)?.let { capture ->
++            return Backend(capture, getHardwareBuffer)
++        }
++
++        val syncCapture = findSingleArgMethod(captureClass, "captureDisplay", argsClass)
++        Log.i(TAG, "$captureClassName: using synchronous captureDisplay(args)")
++        return Backend({ syncCapture.invoke(null, builtArgs) }, getHardwareBuffer)
++    }
++
++    /**
++     * Resolves the Android 14+ pair `createSyncCaptureListener()` +
++     * `captureDisplay(DisplayCaptureArgs, ScreenCaptureListener)`. The listener returned by
++     * `createSyncCaptureListener` carries a single result and its `getBuffer()` blocks until
++     * the compositor delivers it, so a fresh listener is built for every capture.
++     *
++     * Returns null when the class predates the async API, letting the caller fall back.
++     */
++    private fun findAsyncCapture(
++        captureClass: Class<*>,
++        argsClass: Class<*>,
++        builtArgs: Any,
++    ): (() -> Any?)? {
++        val createListener = captureClass.methods.firstOrNull { method ->
++            method.name == "createSyncCaptureListener" && method.parameterTypes.isEmpty()
++        } ?: return null
++        val listenerType = createListener.returnType
++        val capture = (captureClass.methods.asSequence() + captureClass.declaredMethods.asSequence())
++            .firstOrNull { method ->
++                method.name == "captureDisplay" &&
++                    method.parameterTypes.size == 2 &&
++                    method.parameterTypes[0].isAssignableFrom(argsClass) &&
++                    method.parameterTypes[1].isAssignableFrom(listenerType)
++            }
++            ?.also { it.isAccessible = true }
++            ?: return null
++        val getBuffer = runCatching { findNoArgMethod(listenerType, "getBuffer") }
++            .onFailure { Log.w(TAG, "${listenerType.name}.getBuffer() missing", it) }
++            .getOrNull() ?: return null
++        Log.i(TAG, "${captureClass.name}: using async captureDisplay(args, listener)")
++        return {
++            val listener = createListener.invoke(null)
++            capture.invoke(null, builtArgs, listener)
++            getBuffer.invoke(listener)
++        }
+     }
+ 
+     private fun createDisplayCaptureArgsBuilder(captureClassName: String, builderClass: Class<*>): Any {
+@@ -258,9 +299,13 @@ internal class PrivilegedScreenCapture(
+             ?: throw NoSuchMethodException("${cls.name}.$name()")
+     }
+ 
+-    private data class Backend(
+-        val captureDisplay: Method,
+-        val args: Any,
++    /**
++     * One resolved capture path. [capture] hides whether the platform exposes the
++     * synchronous or the listener-based `captureDisplay`, and returns a
++     * `ScreenshotHardwareBuffer` (or null when the compositor produced nothing).
++     */
++    private class Backend(
++        val capture: () -> Any?,
+         val getHardwareBuffer: Method,
+     )
+ 
