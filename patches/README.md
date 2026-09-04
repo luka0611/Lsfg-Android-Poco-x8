@@ -10,16 +10,17 @@ Analysed against:
 | `FrankBarretta/LSFG-Android-Application` | `b8475419` (the commit this fork pins) |
 | `FrankBarretta/lsfg-vk-android` | `release` @ `3e89e543` |
 
-`0001-poco-x8-shizuku-and-overhead-fixes.patch` applies to the application repo:
+The fixes are committed to your app fork, on branch
+`claude/lsfg-mobile-performance-nhe9vx`:
 
-```sh
-cd LSFG-Android-Application
-git apply ../patches/0001-poco-x8-shizuku-and-overhead-fixes.patch
-```
+<https://github.com/luka0611/lsfg-android-application-poco-x8/tree/claude/lsfg-mobile-performance-nhe9vx>
 
-**None of this has been compiled or run on a device** — there is no Android SDK/NDK in
-the environment it was written in. Treat the patch as a reviewed proposal, not a tested
-one. The reasoning behind each hunk is below so you can judge it yourself.
+**Not built as an APK and not run on a device** — there is no Android SDK/NDK in the
+environment this was written in. What *was* verified: `kotlinc` type-checks every changed
+Kotlin file against an `android.jar` with no error referencing the new code, and the
+rewritten `captureContentHash` compiles under `clang -std=c++20`. Treat it as reviewed and
+type-checked, not tested. The reasoning behind each change is below so you can judge it
+yourself.
 
 ---
 
@@ -71,7 +72,7 @@ $ grep -rn "ScreenCaptureListener\|createSyncCaptureListener" app/src/
 (no matches)
 ```
 
-**Fix (in the patch):** probe for `createSyncCaptureListener()` +
+**Fix:** probe for `createSyncCaptureListener()` +
 `captureDisplay(args, listener)` first, and fall back to the legacy one-arg form on older
 releases. A sync listener holds exactly one result, so a fresh one is created per capture
 and `getBuffer()` blocks for it.
@@ -115,7 +116,7 @@ inImg_0.getExtent().width / vk.flowScale
 
 So `0.25` really does shrink the optical-flow pyramid 4×, and it really is the cheapest
 setting. The reason it doesn't help is that **the flow pyramid isn't where the money
-goes**. Three costs are paid per frame regardless of multiplier and flow scale.
+goes**. Four other things dominate, and neither slider touches any of them.
 
 ### 2a. A full-resolution CPU lock of a GPU buffer, on the capture thread, every frame
 
@@ -144,10 +145,11 @@ android.hardware.HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or
 No CPU-read usage at all. Locking for an access the allocation never declared is outside
 the `AHardwareBuffer` contract, and drivers split two ways — both bad:
 
-- **Lock refused** → `captureContentHash` returns 0 → the dedup branch is skipped → *every*
-  capture runs the full `import → copy → framegen → waitIdle → present` pipeline. Since
-  the VirtualDisplay produces frames at the panel rate, that is up to 4× the intended work
-  at 30 fps content. The HUD's "real fps" also freezes, because `uniqueCaptures` stops
+- **Lock refused** → `captureContentHash` returns 0 → the dedup branch is skipped, so
+  duplicate frames reach the worker. This is less severe than it first looks: `pushFrame`
+  bounds `g.pending` at `queueDepth` and drops the oldest, so the pipeline is *not*
+  unbounded — the cost is wasted interpolation on identical pairs, plus a failed ioctl per
+  captured frame. The HUD's "real fps" also freezes, because `uniqueCaptures` stops
   incrementing — worth checking on your device, it's a free diagnostic.
 - **Lock honoured** → the driver resolves the whole compressed surface (AFBC on Mali, UBWC
   on Adreno) to linear and waits on the producing GPU work first — a full-resolution
@@ -156,18 +158,17 @@ the `AHardwareBuffer` contract, and drivers split two ways — both bad:
 Either way it back-pressures SurfaceFlinger's VirtualDisplay, which is exactly the
 "base FPS drops even when I'm not in a game" symptom.
 
-**Fix (in the patch):** declare `USAGE_CPU_READ_OFTEN` on the `ImageReader` so the lock is
-legal, check `desc.usage` before locking, and self-disable hashing after 8 consecutive
-failures instead of retrying forever. The privileged paths can't declare usage — the
-buffer comes from SurfaceFlinger — so there the usage check turns dedup off cleanly rather
-than paying a failed ioctl per frame.
+**Fix:** check `desc.usage` before locking and self-disable hashing when the buffers
+aren't CPU-readable (or after 8 consecutive lock failures) instead of retrying forever.
 
-> **Worth A/B testing:** `CPU_READ_OFTEN` makes gralloc pick a CPU-cached, usually
-> *uncompressed* layout, which costs GPU bandwidth on every framegen read of that buffer.
-> On a bandwidth-bound mid-range part, deleting the hash entirely (accepting no
-> duplicate-skip, and a "real fps" readout that tracks the panel) may beat keeping it.
-> I can't tell which wins without your device. Try the patch first; if it's still heavy,
-> stub `captureContentHash` to `return 0` and compare.
+Declaring `USAGE_CPU_READ_OFTEN` on the `ImageReader` was the other option, and I decided
+against it *because* you're on Mali: it makes gralloc pick a CPU-cached, uncompressed
+layout, which loses AFBC and costs bandwidth on every framegen read of that buffer. On a
+bandwidth-bound part that's the wrong trade — better to lose duplicate-skip, which
+`queueDepth` already partly covers, than to lose compression on the hottest surface in the
+pipeline. If it turns out the hash was carrying more weight than expected, the one-line
+experiment is adding `HardwareBuffer.USAGE_CPU_READ_OFTEN` to the `ImageReader` usage in
+`CaptureEngine.setLsfgMode` and comparing.
 
 ### 2b. The overlay pins your panel to its maximum refresh rate
 
@@ -188,8 +189,8 @@ twice as often as at 60. Add a full-screen `TRANSLUCENT` overlay, which generall
 client (GPU) composition instead of hardware overlay planes, and the fixed cost roughly
 doubles for no benefit when the target app renders at 30–60.
 
-**Fix (in the patch):** make `requestedRefreshRateHz` honour the override, capped at what
-the panel supports. AUTO still means maximum, so nobody's defaults change.
+**Fix:** make `requestedRefreshRateHz` honour the override, capped at what the panel
+supports. AUTO still means maximum, so nobody's defaults change.
 
 ### 2c. Two full GPU pipeline drains per frame
 
@@ -225,12 +226,20 @@ There is no capture-resolution setting — `LsfgConfig` has `flowScale`, `multip
 `VirtualDisplay`, the `ImageReader`, framegen's I/O images and the swapchain blit all run
 at the panel's native resolution.
 
-**Not in the patch** — it needs a pref, drawer UI, and plumbing through
-`setLsfgMode`/`initContext`, and it changes the overlay/capture alignment invariant that
-`OverlayManager` maintains. But it's the single biggest lever available: `createVirtualDisplay`
-already takes explicit `width, height`, and SurfaceFlinger scales during composition, so a
-0.7× capture cuts framegen's per-frame work to roughly half at a cost most people won't
-see through a 2× interpolation. Say the word and I'll build it.
+**Built.** There is now a **Capture scale** slider in the drawer, next to Flow scale:
+0.50–1.00, default 1.00 (so nothing changes until you move it). It scales the
+`VirtualDisplay`, the `ImageReader`, framegen's images and the output image together,
+while the overlay Surface stays native.
+
+It works because both output paths already upscale, which I checked before building it
+rather than assuming: the WSI path blits `src.extent` → `swap.extent` with
+`VK_FILTER_LINEAR`, and the CPU path calls `ANativeWindow_setBuffersGeometry` with the
+produced size and lets SurfaceFlinger scale. So only the render dimensions move;
+`setOutputSurface` keeps the native geometry throughout.
+
+**0.7 is the setting to try first** — roughly half the pixels, and through a 2×
+interpolation most people won't see it. 0.5 is a quarter of the pixels and is where flow
+tracking starts to visibly suffer.
 
 ---
 
@@ -238,9 +247,10 @@ see through a 2× interpolation. Say the word and I'll build it.
 
 These need no code changes and will tell us which of the above dominates on your device:
 
-1. **Set Refresh override to 60 Hz** in the drawer. Today that only changes pacing, not the
-   panel pin (2b) — so if it already helps noticeably, pacing is a factor; if it does
-   nothing, that's consistent with the pin being the problem and the patch should help.
+1. **Set Refresh override to 60 Hz** in the drawer. On your *current* build that only
+   changes pacing, not the panel pin (2b) — so if it already helps noticeably, pacing is a
+   factor; if it does nothing, that's consistent with the pin being the problem, and the
+   new build should help because the override now reaches `setFrameRate` too.
 2. **Turn off all post-processing** — NPU, GPU and CPU stages each add a full-resolution
    pass. `nnapi_postprocess.cpp` is 745 lines of per-frame work.
 3. **Turn off the frame graph HUD.** It polls native counters at 5 Hz and drives an
